@@ -5,7 +5,7 @@
 **Ship RKNN apps to a fleet of Rockchip boards like you mean it:**
 describe the app in one manifest → one command packs it → it lands on every
 board as a systemd service → push the next version, roll back in seconds,
-and get a fleet status report you can trust.
+uninstall safely, and get a fleet status report you can trust.
 
 rk-deploy is a deployment and small-fleet tool for RKNN applications on
 RK3588 / RK3576 / RK356x boards, built for the people who deliver and
@@ -64,7 +64,17 @@ rkdeploy deploy --fleet fleet.yaml demo-1.1.0.tar.gz
 rkdeploy deploy --fleet fleet.yaml --dry-run demo-1.1.0.tar.gz  # preview only, no SSH
 rkdeploy rollback --fleet fleet.yaml --app demo
 rkdeploy status --fleet fleet.yaml             # JSON + per-board summary
+rkdeploy uninstall --fleet fleet.yaml --app demo
+rkdeploy uninstall --fleet fleet.yaml --app demo --allow-last-copy
+rkdeploy uninstall --fleet fleet.yaml --app demo --purge
+rkdeploy uninstall --fleet fleet.yaml --app demo --allow-last-copy --purge
 ```
+
+The uninstall command can also take `--hosts` to select boards. Before it
+removes anything, the controller probes every board in the fleet; an
+unreachable board aborts the operation. `--allow-last-copy` only overrides
+the final-copy safeguard. `--purge` deletes persistent `shared/` data and
+should be used only when that data is no longer needed.
 
 Design rules that will not change:
 
@@ -73,13 +83,17 @@ Design rules that will not change:
 - **Immutable releases + atomic switch.** Each version unpacks into its
   own directory; going live (or rolling back) is a single symlink swap.
 - **Data outlives versions.** Config and data live in a `shared/`
-  directory that upgrades and rollbacks never touch.
+  directory that upgrades, rollbacks and normal uninstalls never touch.
+  `uninstall --purge` is the explicit data-deletion option.
+- **Last-copy protection.** Uninstall inventories the complete fleet and
+  refuses to remove its final installed copy unless `--allow-last-copy`
+  is explicitly supplied. Unreachable boards make the inventory fail closed.
 - **Failed health check = automatic rollback** to the previous version,
   with an explicit verdict — never a half-installed board.
 - **No agent, no new ports, no credential collection.** Plain SSH/scp
-  with your existing keys; one connection per board per operation.
+  with your existing keys; no resident agent or custom transport protocol.
 - **The board stays dumb.** All parsing happens on the controller; the
-  board runs one POSIX shell installer and stock systemd.
+  board runs POSIX shell lifecycle scripts and stock systemd.
 
 ## Roadmap
 

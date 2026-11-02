@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 from rkdeploy import manifest as mf  # noqa: E402
 from rkdeploy.cli import main  # noqa: E402
 from rkdeploy.fleet import Fleet, load_fleet  # noqa: E402
-from rkdeploy.ops import build_status_report, parse_probe, parse_result  # noqa: E402
+from rkdeploy.ops import board_script, build_status_report, parse_probe, parse_result, probe_host  # noqa: E402
 from rkdeploy.pack import build_package  # noqa: E402
 from rkdeploy.unit import render_unit_template  # noqa: E402
 
@@ -181,7 +181,148 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("Dry run complete; no SSH commands", rendered)
 
 
+class UninstallCLITests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.td = tempfile.mkdtemp(prefix="rkdeploy-uninstall-cli-")
+        self.fleet_path = os.path.join(self.td, "fleet.yaml")
+        with open(self.fleet_path, "w", encoding="utf-8") as f:
+            f.write(
+                "hosts:\n"
+                "  - {alias: a, address: 192.0.2.1, user: root}\n"
+                "  - {alias: b, address: 192.0.2.2, user: root}\n"
+            )
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _probe(self, alias, installed=True, reachable=True):
+        return {"alias": alias, "reachable": reachable, "installed": installed}
+
+    def test_refuses_to_remove_the_last_copy_without_override(self):
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=(h.alias == "a"))):
+            with patch("rkdeploy.cli.ops.uninstall_host") as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--hosts", "a", "--jobs", "1",
+                ])
+        self.assertEqual(result, 4)
+        uninstall.assert_not_called()
+
+    def test_allows_selected_removal_when_another_board_keeps_a_copy(self):
+        output = io.StringIO()
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=True)):
+            with patch("rkdeploy.cli.ops.uninstall_host",
+                       return_value={"alias": "a", "outcome": "uninstalled",
+                                     "shared": "preserved", "root_retained": "1",
+                                     "rc": 0, "log": ""}) as uninstall:
+                with redirect_stdout(output):
+                    result = main([
+                        "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                        "--hosts", "a", "--jobs", "1",
+                    ])
+        self.assertEqual(result, 0)
+        self.assertIn("a: uninstalled shared=preserved root_retained=1", output.getvalue())
+        uninstall.assert_called_once()
+        self.assertEqual(uninstall.call_args.args[1], "demo")
+        self.assertFalse(uninstall.call_args.kwargs["purge"])
+
+    def test_unreachable_board_aborts_inventory_before_any_uninstall(self):
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=(h.alias == "a"),
+                               reachable=(h.alias == "a"))):
+            with patch("rkdeploy.cli.ops.uninstall_host") as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--hosts", "a", "--jobs", "1",
+                ])
+        self.assertEqual(result, 4)
+        uninstall.assert_not_called()
+
+    def test_allow_last_copy_is_an_explicit_override(self):
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=(h.alias == "a"))):
+            with patch("rkdeploy.cli.ops.uninstall_host",
+                       return_value={"alias": "a", "outcome": "uninstalled", "rc": 0, "log": ""}) as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--hosts", "a", "--jobs", "1", "--allow-last-copy",
+                ])
+        self.assertEqual(result, 0)
+        self.assertEqual(uninstall.call_count, 1)
+
+    def test_allow_last_copy_does_not_bypass_unreachable_inventory(self):
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=(h.alias == "a"),
+                               reachable=(h.alias == "a"))):
+            with patch("rkdeploy.cli.ops.uninstall_host") as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--hosts", "a", "--jobs", "1", "--allow-last-copy",
+                ])
+        self.assertEqual(result, 4)
+        uninstall.assert_not_called()
+
+    def test_duplicate_fleet_aliases_abort_before_inventory_or_uninstall(self):
+        with open(self.fleet_path, "w", encoding="utf-8") as f:
+            f.write(
+                "hosts:\n"
+                "  - {alias: same, address: 192.0.2.1, user: root}\n"
+                "  - {alias: same, address: 192.0.2.2, user: root}\n"
+            )
+        with patch("rkdeploy.cli.ops.probe_host") as probe:
+            with patch("rkdeploy.cli.ops.uninstall_host") as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--jobs", "1",
+                ])
+        self.assertEqual(result, 2)
+        probe.assert_not_called()
+        uninstall.assert_not_called()
+
+    def test_purge_flag_is_forwarded_to_board_operation(self):
+        with patch("rkdeploy.cli.ops.probe_host", side_effect=lambda h, app:
+                   self._probe(h.alias, installed=True)):
+            with patch("rkdeploy.cli.ops.uninstall_host",
+                       return_value={"alias": "a", "outcome": "uninstalled", "rc": 0, "log": ""}) as uninstall:
+                result = main([
+                    "uninstall", "--fleet", self.fleet_path, "--app", "demo",
+                    "--hosts", "a", "--jobs", "1", "--purge",
+                ])
+        self.assertEqual(result, 0)
+        self.assertTrue(uninstall.call_args.kwargs["purge"])
+
+
 class ProbeTests(unittest.TestCase):
+    def test_incomplete_remote_probe_is_not_a_valid_inventory_record(self):
+        from types import SimpleNamespace
+
+        host = SimpleNamespace(alias="board-a", root_for=lambda app: "/opt/demo")
+        response = SimpleNamespace(returncode=1, stdout="PROBE=1\n", stderr="remote command failed")
+        with patch("rkdeploy.ops.fl.run_ssh", return_value=response):
+            record = probe_host(host, "demo")
+
+        self.assertFalse(record["reachable"])
+        self.assertEqual(record["verdict"], "UNREACHABLE")
+        self.assertEqual(record["probe_error"], "remote probe exited 1")
+
+    def test_successful_probe_requires_inventory_fields(self):
+        from types import SimpleNamespace
+
+        host = SimpleNamespace(alias="board-a", root_for=lambda app: "/opt/demo")
+        response = SimpleNamespace(
+            returncode=0,
+            stdout="PROBE=1\nINSTALLED=0\nSERVICE_ACTIVE=inactive\nSERVICE_ENABLED=disabled\nVERSION=\nPREVIOUS=\n",
+            stderr="",
+        )
+        with patch("rkdeploy.ops.fl.run_ssh", return_value=response):
+            record = probe_host(host, "demo")
+
+        self.assertTrue(record["reachable"])
+        self.assertFalse(record["installed"])
+
     def test_parse_and_verdicts(self):
         kv = {"PROBE": "1", "INSTALLED": "1", "VERSION": "1.0.0", "SERVICE_ACTIVE": "active",
               "SERVICE_ENABLED": "enabled", "MAIN_PID": "42", "RELEASES": "1.0.0,1.1.0",
@@ -279,6 +420,14 @@ class BoardEndToEndTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=120)
 
 
+    def _uninstall(self, purge=False, env=None):
+        script = self._board_script("uninstall.sh")
+        return subprocess.run(
+            ["sh", script, self.root, "demo", "1" if purge else "0"],
+            env=env or self.env, capture_output=True, text=True, timeout=60,
+        )
+
+
 # The lifecycle test proper lives here (kept separate so the fake's
 # process management is exercised exactly as on a real board).
 class LifecycleTests(BoardEndToEndTests):
@@ -327,6 +476,196 @@ class LifecycleTests(BoardEndToEndTests):
         self.assertEqual(kv["HEALTH"], "ok")
         rec = parse_probe("testboard", kv)
         self.assertIn(rec["verdict"], ("HEALTHY", "ATTENTION"))
+
+
+class UninstallBoardTests(BoardEndToEndTests):
+    def test_uninstall_preserves_shared_data_and_status_reports_not_installed(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+        shared_marker = os.path.join(self.root, "shared", "data", "keep.json")
+        os.makedirs(os.path.dirname(shared_marker), exist_ok=True)
+        with open(shared_marker, "w", encoding="utf-8") as f:
+            f.write('{"keep": true}')
+
+        unit = os.path.join(self.sysd, "rkdeploy-demo.service")
+        self.assertTrue(os.path.isfile(unit))
+        result = self._uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("shared=preserved", result.stdout)
+
+        self.assertFalse(os.path.exists(unit))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "releases")))
+        self.assertFalse(os.path.lexists(os.path.join(self.root, "current")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "state.json")))
+        self.assertTrue(os.path.isfile(shared_marker))
+        self.assertEqual(open(shared_marker, encoding="utf-8").read(), '{"keep": true}')
+
+        probe = subprocess.run(
+            ["sh", self._board_script("probe.sh"), self.root, "demo"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        values = dict(line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line)
+        self.assertEqual(values["INSTALLED"], "0")
+        self.assertEqual(parse_probe("board-a", values)["verdict"], "NOT_INSTALLED")
+
+        repeated = self._uninstall()
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertIn("already-uninstalled", repeated.stdout)
+        self.assertTrue(os.path.isfile(shared_marker))
+
+    def test_purge_removes_shared_data_and_empty_install_root(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        marker = os.path.join(self.root, "shared", "data", "remove-me.txt")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("purge me")
+
+        result = self._uninstall(purge=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("shared=purged", result.stdout)
+        self.assertFalse(os.path.exists(self.root))
+
+    def test_purge_after_normal_uninstall_can_remove_preserved_data(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        marker = os.path.join(self.root, "shared", "data", "keep-until-purge.txt")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("later")
+
+        first = self._uninstall()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(os.path.isfile(marker))
+
+        second = self._uninstall(purge=True)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assertFalse(os.path.exists(self.root))
+
+    def test_refuses_symlink_releases_without_removing_target(self):
+        external = os.path.join(self.td, "external-releases")
+        os.makedirs(external)
+        marker = os.path.join(external, "keep.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("outside")
+        os.makedirs(self.root)
+        os.symlink(external, os.path.join(self.root, "releases"))
+
+        result = self._uninstall()
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertTrue(os.path.islink(os.path.join(self.root, "releases")))
+        self.assertTrue(os.path.isfile(marker))
+
+    def test_shared_only_root_is_not_reported_as_installed(self):
+        os.makedirs(os.path.join(self.root, "shared", "data"), exist_ok=True)
+        marker = os.path.join(self.root, "shared", "data", "keep.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("persistent")
+
+        probe = subprocess.run(
+            ["sh", self._board_script("probe.sh"), self.root, "demo"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        values = dict(line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line)
+        self.assertEqual(values["INSTALLED"], "0")
+        self.assertTrue(os.path.isfile(marker))
+
+    def test_uninstall_refuses_symlinked_parent_of_install_root(self):
+        real_parent = os.path.join(self.td, "real-parent")
+        linked_parent = os.path.join(self.td, "linked-parent")
+        root = os.path.join(real_parent, "demo")
+        releases = os.path.join(root, "releases", "1.0.0")
+        os.makedirs(releases)
+        marker = os.path.join(releases, "install.env")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("APP_NAME=demo\n")
+        os.symlink(real_parent, linked_parent)
+
+        script = self._board_script("uninstall.sh")
+        result = subprocess.run(
+            ["sh", script, os.path.join(linked_parent, "demo"), "demo", "0"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("install-root-path-contains-symlink", result.stdout)
+        self.assertTrue(os.path.isfile(marker))
+
+    def test_purge_refuses_shared_symlink_without_touching_target(self):
+        external = os.path.join(self.td, "external-shared")
+        os.makedirs(external)
+        marker = os.path.join(external, "keep.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("outside")
+        os.makedirs(self.root)
+        os.symlink(external, os.path.join(self.root, "shared"))
+
+        result = self._uninstall(purge=True)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertTrue(os.path.islink(os.path.join(self.root, "shared")))
+        self.assertTrue(os.path.isfile(marker))
+
+    def test_unexpected_install_root_files_are_preserved(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        marker = os.path.join(self.root, "operator-notes.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("do not remove")
+
+        result = self._uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(os.path.isfile(marker))
+        self.assertEqual(open(marker, encoding="utf-8").read(), "do not remove")
+        self.assertTrue(os.path.isdir(self.root))
+
+    def test_systemd_state_query_failure_does_not_remove_application_files(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+        broken_systemctl = os.path.join(self.td, "systemctl-state-query-fails")
+        with open(FAKE, encoding="utf-8") as source:
+            fake_source = source.read()
+        old_active = (
+            '    if cmd == "is-active":\n'
+            '        pid = read_pid(unit)\n'
+            '        if pid and alive(pid):\n'
+            '            print("active")\n'
+            '            return 0\n'
+            '        print("inactive")\n'
+            '        return 3'
+        )
+        self.assertIn(old_active, fake_source)
+        with open(broken_systemctl, "w", encoding="utf-8") as f:
+            f.write(fake_source.replace(old_active, '    if cmd == "is-active":\n        return 1'))
+        os.chmod(broken_systemctl, 0o755)
+
+        env = dict(self.env, RKDEPLOY_SYSTEMCTL=broken_systemctl)
+        result = self._uninstall(env=env)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("cannot-query-service-state", result.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "current", "install.env")))
+        self.assertTrue(os.path.isfile(os.path.join(self.sysd, "rkdeploy-demo.service")))
+
+    def test_stop_failure_does_not_remove_application_files(self):
+        installed = self._install2("1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+        broken_systemctl = os.path.join(self.td, "systemctl-stop-fails")
+        with open(FAKE, encoding="utf-8") as source:
+            fake_source = source.read()
+        old_stop = '    if cmd == "stop":\n        stop(unit)\n        return 0'
+        new_stop = '    if cmd == "stop":\n        return 1'
+        self.assertIn(old_stop, fake_source)
+        with open(broken_systemctl, "w", encoding="utf-8") as f:
+            f.write(fake_source.replace(old_stop, new_stop))
+        os.chmod(broken_systemctl, 0o755)
+
+        env = dict(self.env, RKDEPLOY_SYSTEMCTL=broken_systemctl)
+        result = self._uninstall(env=env)
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "current", "install.env")))
+        self.assertTrue(os.path.isfile(os.path.join(self.sysd, "rkdeploy-demo.service")))
 
 
 if __name__ == "__main__":

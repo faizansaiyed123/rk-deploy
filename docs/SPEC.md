@@ -22,8 +22,8 @@ overlap: rk-deploy's status only looks at the apps it deployed.
    ships. Model files are moved as opaque bytes — never opened, parsed,
    or content-checked (whole-package hashes only).
 2. **Smart controller, dumb board.** All parsing and rendering decisions
-   happen on the controller. The board runs a single POSIX `sh`
-   installer plus stock coreutils/systemd: no extra packages, and it
+   happen on the controller. The board runs POSIX `sh` lifecycle
+   scripts plus stock coreutils/systemd: no extra packages, and it
    never parses YAML (board Python/library stacks vary too much across
    BSPs — validated finding #1 below).
 3. **Immutable releases, atomic switch.** Every version unpacks into its
@@ -45,15 +45,17 @@ overlap: rk-deploy's status only looks at the apps it deployed.
 rkdeploy pack     [--manifest rkdeploy.yaml] [--out dist/]
 rkdeploy deploy   --fleet fleet.yaml <package.tar.gz> [--hosts tag:x|name,...] [--jobs 4] [--no-auto-rollback]
 rkdeploy rollback --fleet fleet.yaml --app <name> [--to <version>] [--hosts ...]
+rkdeploy uninstall --fleet fleet.yaml --app <name> [--hosts ...] [--jobs 4] [--allow-last-copy] [--purge]
 rkdeploy status   --fleet fleet.yaml [--app <name>] [--json report.json]
 rkdeploy releases --fleet fleet.yaml --app <name>
 rkdeploy --version
 ```
 
 Exit codes: 0 all ok · 2 manifest/usage error (no board touched) ·
-4 board-side verification failed (hash/preflight) · 5 partial fleet
-failure (remaining boards completed) · 6 deploy failed but auto-rollback
-succeeded · 7 deploy failed and rollback failed (human needed first).
+4 verification/preflight blocked an operation before destructive changes ·
+5 partial fleet operation failure · 6 deploy failed but auto-rollback
+succeeded · 7 board operation failed or deploy rollback failed (human
+review may be required).
 
 ## Manifest (`rkdeploy.yaml`, schema 1)
 
@@ -179,10 +181,12 @@ ssh:
   script, one remote execution. No agent process, no new listening
   port, no custom protocol — integrators' existing jump hosts / VPNs /
   LANs just work.
-- **One connection per board per operation** (validated finding #2):
-  the health-check wait loop runs inside the board-side installer, not
-  by polling from the controller. Controllers should also enable SSH
-  connection multiplexing (ControlMaster).
+- **One connection per board operation** for deploy, rollback and status
+  (validated finding #2): the health-check wait loop runs inside the
+  board-side installer, not by polling from the controller. Uninstall is
+  deliberately two-phase: a fleet-wide inventory probe, followed by one
+  uninstall execution on each selected board. Controllers should also
+  enable SSH connection multiplexing (ControlMaster).
 - Default concurrency 4 (`--jobs`), `--serial` available; one board's
   failure never blocks the rest — the summary names it and the exit
   code is 5.
@@ -235,9 +239,49 @@ direction. This boundary is stated here, in the README, and in the
 manual, because it is exactly the kind of thing people assume a deploy
 tool does for them. It does not.
 
+## Uninstall
+
+`rkdeploy uninstall --fleet fleet.yaml --app <name>` removes the
+rk-deploy-managed application from all fleet boards by default.
+`--hosts` may narrow the boards changed, but it does not narrow the
+safety inventory: before any destructive operation, the controller
+probes every board in the fleet. Duplicate host aliases or any
+unreachable/unverifiable board abort the operation before changes.
+
+The controller refuses to remove the final installed copy when the
+selected targets contain every installed copy. `--allow-last-copy`
+explicitly overrides only this final-copy guard; it does not bypass
+fleet inventory or duplicate-alias checks.
+
+On each selected board, the uninstall script:
+
+1. Validates the app name, install root and managed paths. It refuses
+   symlinks at managed paths rather than following them into unrelated
+   data.
+2. Stops the `rkdeploy-<name>.service` unit, disables it, removes its
+   unit file, and runs `systemctl daemon-reload`. A stop/disable/reload
+   failure is reported and prevents the subsequent application-file
+   removal.
+3. Removes the `current` symlink, `releases/`, `state.json`,
+   `history.jsonl` and the temporary state file.
+4. Preserves `shared/` by default. `--purge` explicitly removes it.
+
+The install root is removed only if it is empty after managed files are
+removed. Unexpected files are left in place. Normal uninstall is
+idempotent; a subsequent `--purge` can remove shared data preserved by
+an earlier uninstall.
+
+The status probe does not classify a shared-only install root as an
+installed application. A deployment marker (state, current release
+link, release install metadata, managed unit file, or running service)
+is needed for `INSTALLED=1`.
+
 ## Status (fleet inspection)
 
-One connection per board, one composite probe on the board:
+One connection per board, one composite probe on the board.
+A root directory containing only preserved `shared/` data is not
+considered installed; deployment metadata, a managed unit or a running
+managed service must still identify an application installation.
 
 | Item | Source | Verdict rule |
 |---|---|---|

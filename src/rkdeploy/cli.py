@@ -5,7 +5,7 @@ import sys
 
 from . import __version__, ops
 from .fleet import FleetError, load_fleet, run_fleet
-from .manifest import ManifestError
+from .manifest import ManifestError, NAME_RE
 from .pack import build_package
 
 # exit codes (docs/SPEC.md)
@@ -84,6 +84,105 @@ def cmd_rollback(args):
     return worst
 
 
+def cmd_uninstall(args):
+    if not NAME_RE.match(args.app):
+        print("error: app name must match ^[a-z][a-z0-9-]{1,31}$", file=sys.stderr)
+        return USAGE
+
+    fleet = _load(args)
+    hosts = _select(fleet, args)
+    if not hosts:
+        print("error: host selection matched no boards; no changes made", file=sys.stderr)
+        return USAGE
+
+    aliases = [host.alias for host in fleet.hosts]
+    if len(aliases) != len(set(aliases)):
+        print(
+            "error: fleet contains duplicate host aliases; "
+            "cannot safely inventory or uninstall",
+            file=sys.stderr,
+        )
+        return USAGE
+
+    target_aliases = {host.alias for host in hosts}
+
+    # Always inventory the complete fleet, not just the selected uninstall
+    # targets. The override bypasses only the last-copy guard; it does not
+    # turn an unreachable board into an assumed-safe inventory result.
+    inventory = run_fleet(
+        fleet.hosts,
+        lambda host: ops.probe_host(host, args.app),
+        jobs=args.jobs,
+    )
+    unreachable = []
+    installed = set()
+    for host in fleet.hosts:
+        record = inventory.get(host.alias)
+        if isinstance(record, Exception) or not record or not record.get("reachable"):
+            unreachable.append(host.alias)
+        elif record.get("installed"):
+            installed.add(host.alias)
+
+    if unreachable:
+        names = ", ".join(sorted(unreachable))
+        print(
+            f"error: cannot verify application inventory on: {names}; "
+            "no boards were changed",
+            file=sys.stderr,
+        )
+        return VERIFY
+
+    if not args.allow_last_copy:
+        selected_installed = installed & target_aliases
+        remaining_installed = installed - target_aliases
+        if selected_installed and not remaining_installed:
+            names = ", ".join(sorted(selected_installed))
+            print(
+                f"error: uninstall would remove the fleet's last installed copy "
+                f"({names}); re-run with --allow-last-copy to confirm",
+                file=sys.stderr,
+            )
+            return VERIFY
+
+    results = run_fleet(
+        hosts,
+        lambda host: ops.uninstall_host(host, args.app, purge=args.purge),
+        jobs=args.jobs,
+    )
+    outcomes = {}
+    for host in hosts:
+        result = results.get(host.alias)
+        if isinstance(result, Exception):
+            result = {"alias": host.alias, "outcome": "error", "log": str(result)}
+        if not result:
+            result = {"alias": host.alias, "outcome": "error", "log": "no result returned"}
+        outcomes[host.alias] = result
+        detail = result.get("log", "").strip()
+        status = []
+        if result.get("shared"):
+            status.append(f"shared={result['shared']}")
+        if result.get("root_retained") is not None:
+            status.append(f"root_retained={result['root_retained']}")
+        suffix = (" " + " ".join(status)) if status else ""
+        if detail and result["outcome"] not in ("uninstalled", "already-uninstalled"):
+            suffix += f" — {detail[-240:]}"
+        print(f"{host.alias}: {result['outcome']}{suffix}")
+
+    successes = sum(
+        result["outcome"] in ("uninstalled", "already-uninstalled")
+        for result in outcomes.values()
+    )
+    failures = [result for result in outcomes.values()
+                if result["outcome"] not in ("uninstalled", "already-uninstalled")]
+    if not failures:
+        return OK
+    if successes:
+        return PARTIAL
+    if all(result["outcome"] == "aborted" for result in failures):
+        return VERIFY
+    return FAILED
+
+
 def cmd_status(args):
     fleet = _load(args)
     hosts = _select(fleet, args)
@@ -148,6 +247,17 @@ def main(argv=None):
             sp.add_argument("--app", required=True)
             sp.add_argument("--to", default=None)
         sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("uninstall", help="remove an app from selected fleet boards")
+    sp.add_argument("--fleet", required=True)
+    sp.add_argument("--app", required=True)
+    sp.add_argument("--hosts", default=None, help="comma aliases or tag:<tag>")
+    sp.add_argument("--jobs", type=int, default=4)
+    sp.add_argument("--allow-last-copy", action="store_true",
+                    help="explicitly allow removing the fleet's final installed copy")
+    sp.add_argument("--purge", action="store_true",
+                    help="also delete the app's shared/ data (irreversible)")
+    sp.set_defaults(fn=cmd_uninstall)
 
     sp = sub.add_parser("status", help="fleet status report")
     sp.add_argument("--fleet", required=True)
