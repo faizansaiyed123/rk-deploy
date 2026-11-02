@@ -6,6 +6,16 @@
   and the fully rendered systemd unit, with zero SSH contact.
   Contributed by @faizansaiyed123 in #6 (first external PR; closes #3).
 
+- `rkdeploy uninstall`: fleet-wide preflight before removing an app;
+  refuses to remove the final installed copy unless
+  `--allow-last-copy` is explicit. Stops/disables the managed service,
+  removes release and deployment metadata, and preserves `shared/` unless
+  `--purge` is supplied. The status probe no longer treats a shared-only
+  install root as an installed application.
+- Uninstall coverage for last-copy protection, unreachable inventory,
+  shared-data preservation/purge, idempotency, symlink refusal and stop
+  failures.
+
 ## v0.1.0 — 2026-11-02
 
 First release. Full pipeline implemented and validated end to end on a

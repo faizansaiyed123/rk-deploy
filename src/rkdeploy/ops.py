@@ -1,7 +1,8 @@
-"""Controller-side operations: deploy / rollback / status / releases."""
+"""Controller-side operations: deploy / rollback / uninstall / status / releases."""
 import json
 import os
 import re
+import shlex
 import tarfile
 import tempfile
 from importlib import resources
@@ -87,8 +88,10 @@ def deploy_host(host, package_path, app, no_auto_rollback=False):
 def rollback_host(host, app, to=None):
     root = host.root_for(app)
     script = board_script("rollback.sh")
-    cmd = f"sh -s {root} {app}" + (f" {to}" if to else "")
-    r = fl.run_ssh(host, cmd, stdin_data=script, timeout=600)
+    args = f"{shlex.quote(root)} {shlex.quote(app)}"
+    if to:
+        args += f" {shlex.quote(to)}"
+    r = fl.run_ssh(host, f"sh -s -- {args}", stdin_data=script, timeout=600)
     parsed = parse_result(r.stdout)
     outcome = parsed[0] if parsed else ("error" if r.returncode else "unknown")
     return {"alias": host.alias, "outcome": outcome,
@@ -96,17 +99,46 @@ def rollback_host(host, app, to=None):
             "rc": r.returncode, "log": (r.stdout + r.stderr).strip()[-1200:]}
 
 
+def uninstall_host(host, app, purge=False):
+    """Uninstall one app from one board using the packaged POSIX shell script."""
+    root = host.root_for(app)
+    script = board_script("uninstall.sh")
+    purge_arg = "1" if purge else "0"
+    cmd = f"sh -s -- {shlex.quote(root)} {shlex.quote(app)} {purge_arg}"
+    r = fl.run_ssh(host, cmd, stdin_data=script, timeout=600)
+    parsed = parse_result(r.stdout)
+    outcome = parsed[0] if parsed else ("error" if r.returncode else "unknown")
+    details = parsed[1] if parsed else {}
+    return {"alias": host.alias, "outcome": outcome,
+            "shared": details.get("shared"),
+            "root_retained": details.get("root_retained"),
+            "rc": r.returncode, "log": (r.stdout + r.stderr).strip()[-1200:]}
+
+
 def probe_host(host, app):
     root = host.root_for(app)
     script = board_script("probe.sh")
-    r = fl.run_ssh(host, f"sh -s {root} {app}", stdin_data=script, timeout=120)
-    if r.returncode != 0 and "PROBE=1" not in r.stdout:
-        return {"alias": host.alias, "reachable": False}
+    cmd = f"sh -s -- {shlex.quote(root)} {shlex.quote(app)}"
+    r = fl.run_ssh(host, cmd, stdin_data=script, timeout=120)
     kv = {}
     for line in r.stdout.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             kv[k.strip()] = v.strip()
+
+    # A marker emitted at the beginning of the script is not proof that the
+    # whole inventory completed. Require a successful SSH command and all
+    # inventory-defining fields before this board can count as a remaining
+    # application copy.
+    required = ("PROBE", "INSTALLED", "SERVICE_ACTIVE", "SERVICE_ENABLED")
+    complete = all(key in kv for key in required) and kv.get("PROBE") == "1"
+    if r.returncode != 0 or not complete:
+        record = parse_probe(host.alias, {})
+        record["probe_error"] = (
+            f"remote probe exited {r.returncode}" if r.returncode != 0
+            else "remote probe returned incomplete inventory"
+        )
+        return record
     return parse_probe(host.alias, kv)
 
 
